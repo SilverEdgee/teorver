@@ -5,5 +5,3 @@ numpy
 pandas
 matplotlib
 arch
-# Install pylevy directly from GitHub
-pylevy @ git+https://github.com/josemiotto/pylevy
