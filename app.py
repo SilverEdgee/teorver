@@ -119,12 +119,14 @@ def load_data(ticker, start_date, end_date):
         return None, None, None
 
 
-def fit_levy_stable_fast(returns_data, max_samples=None):
+def fit_levy_stable_fast(returns_data, tail_percentile=0.70):
     """
     Быстрая эмпирическая оценка параметров стабильного распределения.
-    Использует метод регрессии хвостов (Tail Index) для оценки Alpha
-    и робастные квантильные оценки для остальных параметров.
-    Это заменяет медленную MLE оптимизацию.
+    Использует метод регрессии хвостов (Tail Index) для оценки Alpha.
+
+    Args:
+        returns_data: Данные доходности
+        tail_percentile: Порог для определения хвоста (0.70 = топ 30%, 0.90 = топ 10%)
     """
     # Преобразуем в массив numpy и убираем NaN
     x = returns_data.values if isinstance(returns_data, pd.Series) else returns_data
@@ -146,8 +148,9 @@ def fit_levy_stable_fast(returns_data, max_samples=None):
         sorted_dev = np.sort(abs_dev)
         n = len(sorted_dev)
 
-        # Используем топ 30% хвоста для оценки
-        cutoff_idx = int(n * 0.70)
+        # Используем порог из аргументов
+        cutoff_idx = int(n * tail_percentile)
+
         if cutoff_idx < n - 5:
             tail_data = sorted_dev[cutoff_idx:]
 
@@ -195,11 +198,17 @@ def plot_distributions_pdf(log_returns, fit_params, ticker):
     last_vol = garch_fit.conditional_volatility.iloc[-1] / 100
 
     st.subheader("2. Оцененные параметры моделей")
+
+    # Маркер того, что используется "худшая" alpha
+    alpha_label = f"{ls_alpha:.4f}"
+    if ls_alpha < 1.7:
+        alpha_label += " (Stress Test)"
+
     param_data = {
         "Параметр": ["Среднее (μ) / Локация (loc)", "Ст. откл. (σ) / Масштаб (scale)", "Индекс стабильности (α)",
                      "Асимметрия (β)", "Ст. волатильность (ω)", "ARCH (α[1])", "GARCH (β[1])", "Форма (ν)"],
         "Гауссова": [f"{g_mu:.5f}", f"{g_std:.5f}", "-", "-", "-", "-", "-", "-"],
-        "Леви-стабильная": [f"{ls_loc:.5f}", f"{ls_scale:.5f}", f"{ls_alpha:.4f}", f"{ls_beta:.4f}", "-", "-", "-",
+        "Леви-стабильная": [f"{ls_loc:.5f}", f"{ls_scale:.5f}", alpha_label, f"{ls_beta:.4f}", "-", "-", "-",
                             "-"],
         "GARCH(1,1)-t": [f"{garch_params['mu'] / 100:.5f}", f"{last_vol:.5f} (условное)", "-", "-",
                          f"{garch_params['omega']:.5f}", f"{garch_params['alpha[1]']:.4f}",
@@ -249,58 +258,134 @@ def plot_distributions_pdf(log_returns, fit_params, ticker):
 
     st.subheader("3. Визуальное сравнение плотностей")
 
-    # --- ИСПРАВЛЕНИЕ МАСШТАБА: ДОБАВЛЕН ПЕРЕКЛЮЧАТЕЛЬ ---
-    col_ctrl1, col_ctrl2 = st.columns([1, 3])
+    # --- УПРАВЛЕНИЕ ГРАФИКОМ ---
+    col_ctrl1, col_ctrl2, col_ctrl3 = st.columns([1, 1, 2])
     with col_ctrl1:
-        use_log_scale = st.checkbox("🔍 Логарифмическая шкала", value=False,
+        use_log_scale = st.checkbox("🔍 Логарифмическая шкала", value=True,
                                     help="Включите, чтобы увидеть разницу в хвостах распределений")
 
-    fig, ax = plt.subplots(figsize=(14, 8))
+    with col_ctrl2:
+        zoom_tails = st.checkbox("🔭 Увеличить хвосты", value=False,
+                                 help="Показать отдельные графики для левого и правого хвоста распределения")
 
-    # Гистограмма эмпирических данных
-    ax.hist(log_returns, bins=150, density=True, alpha=0.5, label=f'Эмпирические данные ({ticker})', color='lightblue',
-            edgecolor='blue')
+    tail_threshold = 0.05
+    if zoom_tails:
+        with col_ctrl3:
+            tail_pct = st.slider("Показать крайние % (хвосты)", 1, 20, 5, 1,
+                                 help="Сколько процентов самых экстремальных значений показать")
+            tail_threshold = tail_pct / 100.0
 
-    x = np.linspace(log_returns.min(), log_returns.max(), 1000)
+    # Общая ось X для отрисовки линий
+    # Расширяем диапазон, чтобы хвосты не обрезались
+    x_min, x_max = log_returns.min(), log_returns.max()
+    margin = (x_max - x_min) * 0.2
+    x_full = np.linspace(x_min - margin, x_max + margin, 2000)
 
-    # Теоретические распределения
-    ax.plot(x, norm.pdf(x, g_mu, g_std), 'r-', lw=3, label=f'Гауссово (μ={g_mu:.4f}, σ={g_std:.4f})')
-    ax.plot(x, levy_stable.pdf(x, ls_alpha, ls_beta, ls_loc, ls_scale), 'g-', lw=3,
-            label=f'Леви-стабильное (α={ls_alpha:.2f})')
+    # Предварительный расчет теоретических PDF (чтобы не дублировать код)
+    pdf_norm = norm.pdf(x_full, g_mu, g_std)
+    pdf_levy = levy_stable.pdf(x_full, ls_alpha, ls_beta, ls_loc, ls_scale)
+    pdf_garch = t.pdf(x_full, df=nu, loc=garch_params['mu'] / 100, scale=last_vol)
 
-    garch_t_pdf = t.pdf(x, df=nu, loc=garch_params['mu'] / 100, scale=last_vol)
-    ax.plot(x, garch_t_pdf, 'm-', lw=3, label=f'GARCH-t (ν={nu:.2f})')
+    if not zoom_tails:
+        fig, ax = plt.subplots(figsize=(14, 8))
 
-    # --- ПРИМЕНЕНИЕ ЛОГАРИФМИЧЕСКОГО МАСШТАБА ---
-    if use_log_scale:
-        ax.set_yscale('log')
-        ax.set_ylim(bottom=0.001)  # Обрезаем слишком низкие значения, чтобы график был чище
-        scale_title = " (Логарифмическая шкала)"
-        st.caption(
-            "ℹ️ В логарифмической шкале обратите внимание, как зеленая и фиолетовая линии проходят **выше** красной на краях графика.")
+        # Гистограмма эмпирических данных
+        ax.hist(log_returns, bins=150, density=True, alpha=0.5, label=f'Эмпирические данные ({ticker})',
+                color='lightblue',
+                edgecolor='blue')
+
+        # Теоретические распределения
+        ax.plot(x_full, pdf_norm, 'r-', lw=3, label=f'Гауссово (Normal)')
+        ax.plot(x_full, pdf_levy, 'g-', lw=3, label=f'Леви-стабильное (Stress α={ls_alpha:.2f})')
+        ax.plot(x_full, pdf_garch, 'm-', lw=3, label=f'GARCH-t (Current)')
+
+        # --- ПРИМЕНЕНИЕ ЛОГАРИФМИЧЕСКОГО МАСШТАБА ---
+        if use_log_scale:
+            ax.set_yscale('log')
+            ax.set_ylim(bottom=0.001)  # Обрезаем слишком низкие значения, чтобы график был чище
+            scale_title = " (Логарифмическая шкала)"
+            st.caption(
+                "ℹ️ В логарифмической шкале обратите внимание, как зеленая и фиолетовая линии проходят **выше** красной на краях графика.")
+        else:
+            scale_title = ""
+            ax.set_ylim(top=ax.get_ylim()[1] * 1.05)
+
+        ax.set_title(f'Сравнение плотностей распределений дневной доходности {ticker}{scale_title}', fontsize=14,
+                     fontweight='bold')
+        ax.set_xlabel('Логарифмическая доходность', fontsize=12)
+        ax.set_ylabel('Плотность вероятности', fontsize=12)
+        ax.legend(loc='best', fontsize=11)
+        ax.grid(True, linestyle='--', alpha=0.4, which='both')  # which='both' включает сетку для лог шкалы
+
+        # Немного расширяем границы по X, чтобы было видно хвосты
+        ax.set_xlim(log_returns.min() * 1.1, log_returns.max() * 1.1)
+
+        plt.tight_layout()
+        st.pyplot(fig)
+
     else:
-        scale_title = ""
+        # --- РЕЖИМ ЗУМА: ДВА ГРАФИКА ДЛЯ ХВОСТОВ ---
+        q_left = log_returns.quantile(tail_threshold)
+        q_right = log_returns.quantile(1 - tail_threshold)
 
-    ax.set_title(f'Сравнение плотностей распределений дневной доходности {ticker}{scale_title}', fontsize=14,
-                 fontweight='bold')
-    ax.set_xlabel('Логарифмическая доходность', fontsize=12)
-    ax.set_ylabel('Плотность вероятности', fontsize=12)
-    ax.legend(loc='best', fontsize=11)
-    ax.grid(True, linestyle='--', alpha=0.4, which='both')  # which='both' включает сетку для лог шкалы
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
 
-    # Немного расширяем границы по X, чтобы было видно хвосты
-    ax.set_xlim(log_returns.min() * 1.05, log_returns.max() * 1.05)
+        # --- ЛЕВЫЙ ХВОСТ (Падения) ---
+        ax1.hist(log_returns, bins=300, density=True, alpha=0.5, color='lightblue', edgecolor='blue')
+        ax1.plot(x_full, pdf_norm, 'r-', lw=3, label='Гауссово')
+        ax1.plot(x_full, pdf_levy, 'g-', lw=3, label='Леви-стабильное')
+        ax1.plot(x_full, pdf_garch, 'm-', lw=3, label='GARCH-t')
 
-    if not use_log_scale:
-        ax.set_ylim(top=ax.get_ylim()[1] * 1.05)
+        ax1.set_xlim(log_returns.min() * 1.1, q_left)  # Зум влево
+        ax1.set_title(f"📉 Левый хвост (Худшие {tail_pct}%)", fontsize=12, fontweight='bold')
+        ax1.set_ylabel('Плотность', fontsize=10)
+        ax1.set_xlabel('Доходность', fontsize=10)
+        ax1.grid(True, linestyle='--', alpha=0.4, which='both')
 
-    plt.tight_layout()
-    st.pyplot(fig)
+        # --- ПРАВЫЙ ХВОСТ (Рост) ---
+        ax2.hist(log_returns, bins=300, density=True, alpha=0.5, color='lightblue', edgecolor='blue')
+        ax2.plot(x_full, pdf_norm, 'r-', lw=3, label='Гауссово')
+        ax2.plot(x_full, pdf_levy, 'g-', lw=3, label='Леви-стабильное')
+        ax2.plot(x_full, pdf_garch, 'm-', lw=3, label='GARCH-t')
+
+        ax2.set_xlim(q_right, log_returns.max() * 1.1)  # Зум вправо
+        ax2.set_title(f"📈 Правый хвост (Лучшие {tail_pct}%)", fontsize=12, fontweight='bold')
+        ax2.set_xlabel('Доходность', fontsize=10)
+        ax2.legend()
+        ax2.grid(True, linestyle='--', alpha=0.4, which='both')
+
+        if use_log_scale:
+            ax1.set_yscale('log')
+            ax2.set_yscale('log')
+            y_min_zoom = 0.0001
+            ax1.set_ylim(bottom=y_min_zoom)
+            ax2.set_ylim(bottom=y_min_zoom)
+        else:
+            # Авто-масштаб Y
+            mask_left = x_full <= q_left
+            mask_right = x_full >= q_right
+
+            max_y_left = max(
+                pdf_norm[mask_left].max() if np.any(mask_left) else 1,
+                pdf_levy[mask_left].max() if np.any(mask_left) else 1,
+                pdf_garch[mask_left].max() if np.any(mask_left) else 1
+            )
+            max_y_right = max(
+                pdf_norm[mask_right].max() if np.any(mask_right) else 1,
+                pdf_levy[mask_right].max() if np.any(mask_right) else 1,
+                pdf_garch[mask_right].max() if np.any(mask_right) else 1
+            )
+
+            ax1.set_ylim(0, max_y_left * 1.5)
+            ax2.set_ylim(0, max_y_right * 1.5)
+
+        plt.tight_layout()
+        st.pyplot(fig)
 
     st.info(
-        "💡 **Ключевой вывод:** Обратите внимание на **хвосты распределения** (крайние значения слева и справа). "
-        "Гауссова модель (красная) обычно **недооценивает** вероятность экстремальных событий по сравнению с "
-        "Леви-стабильной (зеленая) и GARCH-t (фиолетовая) моделями."
+        "💡 **Ключевой вывод:** Обратите внимание на **хвосты распределения**. "
+        "В данной версии график 'Леви' построен на основе **худшего** значения Alpha из истории (Stress Test), "
+        "чтобы показать максимальный потенциальный риск."
     )
 
 
@@ -333,7 +418,8 @@ def run_and_plot_var_simulation(fit_params, capital, horizon, confidence, sims=1
     col1.metric(label="VaR (Гаусс)", value=f"${var_g:,.0f}",
                 help=f"С вероятностью {100 - confidence:.1f}% убыток НЕ превысит эту сумму.")
     col2.metric(label="VaR (Леви-стабильная)", value=f"${var_ls:,.0f}", delta=f"{((var_ls - var_g) / var_g):.1%}",
-                delta_color="inverse", help="Дельта показывает разницу с Гауссовой моделью.")
+                delta_color="inverse",
+                help="Дельта показывает разницу с Гауссовой моделью. Используется Worst Case Alpha.")
     col3.metric(label="VaR (GARCH-t)", value=f"${var_garch:,.0f}", delta=f"{((var_garch - var_g) / var_g):.1%}",
                 delta_color="inverse", help="Дельта показывает разницу с Гауссовой моделью.")
 
@@ -370,7 +456,7 @@ def run_and_plot_var_simulation(fit_params, capital, horizon, confidence, sims=1
     bins = np.linspace(lower_bound, upper_bound, 100)
 
     ax.hist(losses_g, bins=bins, density=True, alpha=0.6, label='Гауссова модель', color='red', edgecolor='darkred')
-    ax.hist(losses_ls, bins=bins, density=True, alpha=0.6, label='Леви-стабильная модель', color='green',
+    ax.hist(losses_ls, bins=bins, density=True, alpha=0.6, label='Леви-стабильная (Stress)', color='green',
             edgecolor='darkgreen')
     ax.hist(losses_garch, bins=bins, density=True, alpha=0.6, label='GARCH-t модель', color='purple',
             edgecolor='indigo')
@@ -398,7 +484,7 @@ def run_and_plot_var_simulation(fit_params, capital, horizon, confidence, sims=1
     st.info(
         f"**💡 Интерпретация результатов:**\n\n"
         f"• **Гауссова модель** предполагает 'нормальное' распределение и может **недооценивать** экстремальные риски.\n"
-        f"• **Леви-стабильная** учитывает 'толстые хвосты' и показывает VaR на {abs((var_ls - var_g) / var_g * 100):.1f}% {'выше' if var_ls > var_g else 'ниже'}.\n"
+        f"• **Леви-стабильная** здесь работает в режиме **стресс-теста** (использует худшее значение Alpha за историю). VaR на {abs((var_ls - var_g) / var_g * 100):.1f}% {'выше' if var_ls > var_g else 'ниже'}.\n"
         f"• **GARCH-t** учитывает изменяющуюся во времени волатильность.\n\n"
         f"Чем больше разница между моделями, тем важнее учитывать 'хвостовые риски' при принятии решений."
     )
@@ -408,7 +494,7 @@ def run_and_plot_var_simulation(fit_params, capital, horizon, confidence, sims=1
 
 
 @st.cache_data
-def calculate_rolling_alpha(log_returns, window_size):
+def calculate_rolling_alpha(log_returns, window_size, tail_cutoff=0.70):
     """Рассчитывает параметр alpha в скользящем окне."""
     if len(log_returns) < window_size:
         return None
@@ -417,7 +503,7 @@ def calculate_rolling_alpha(log_returns, window_size):
         if len(x) >= 100:
             try:
                 # Быстрая подгонка с ограничением выборки
-                alpha, _, _, _ = fit_levy_stable_fast(x, max_samples=500)
+                alpha, _, _, _ = fit_levy_stable_fast(x, tail_percentile=tail_cutoff)
                 return alpha
             except:
                 return np.nan
@@ -427,7 +513,7 @@ def calculate_rolling_alpha(log_returns, window_size):
     return rolling_alpha.dropna()
 
 
-def plot_rolling_alpha(log_returns, window_size, ticker):
+def plot_rolling_alpha(log_returns, window_size, ticker, tail_cutoff):
     """Отображает график rolling alpha."""
     st.subheader("Динамика параметра стабильности α (Alpha)")
     st.write("""
@@ -451,8 +537,8 @@ def plot_rolling_alpha(log_returns, window_size, ticker):
         )
         return
 
-    with st.spinner(f"Расчет rolling alpha с окном {window_size} дней... Это может занять 1-2 минуты."):
-        rolling_alpha = calculate_rolling_alpha(log_returns, window_size)
+    with st.spinner(f"Расчет rolling alpha с окном {window_size} дней (чувствительность {tail_cutoff * 100:.0f}%)..."):
+        rolling_alpha = calculate_rolling_alpha(log_returns, window_size, tail_cutoff)
 
     if rolling_alpha is None or rolling_alpha.empty or len(rolling_alpha) < 10:
         st.error(
@@ -469,7 +555,10 @@ def plot_rolling_alpha(log_returns, window_size, ticker):
             color='cyan', linewidth=2, alpha=0.8)
 
     mean_alpha = rolling_alpha.mean()
+    min_alpha = rolling_alpha.min()
+
     ax.axhline(mean_alpha, color='red', linestyle='--', lw=2, label=f'Среднее α = {mean_alpha:.2f}')
+    ax.axhline(min_alpha, color='green', linestyle='--', lw=2, label=f'Min α = {min_alpha:.2f} (Stress)')
     ax.axhline(2.0, color='gray', linestyle=':', lw=1.5, label='α = 2 (Нормальное распределение)', alpha=0.7)
 
     # Добавляем зоны риска
@@ -480,7 +569,7 @@ def plot_rolling_alpha(log_returns, window_size, ticker):
     ax.set_title(f'Динамика параметра стабильности α для {ticker}', fontsize=14, fontweight='bold')
     ax.set_xlabel('Дата', fontsize=12)
     ax.set_ylabel('Значение α (Alpha)', fontsize=12)
-    ax.legend(loc='best', fontsize=10)
+    ax.legend(loc='lower left', fontsize=10)
     ax.grid(True, linestyle='--', alpha=0.4)
     ax.set_ylim(bottom=max(0, rolling_alpha.min() - 0.1), top=min(2.1, rolling_alpha.max() + 0.1))
 
@@ -492,7 +581,7 @@ def plot_rolling_alpha(log_returns, window_size, ticker):
     st.subheader("📊 Статистика параметра α")
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Среднее α", f"{mean_alpha:.3f}")
-    col2.metric("Мин α", f"{rolling_alpha.min():.3f}")
+    col2.metric("Мин α (Стресс)", f"{rolling_alpha.min():.3f}")
     col3.metric("Макс α", f"{rolling_alpha.max():.3f}")
     col4.metric("Ст. откл.", f"{rolling_alpha.std():.3f}")
 
@@ -516,6 +605,8 @@ def plot_rolling_alpha(log_returns, window_size, ticker):
         f"**Контекст:** Чем ниже α, тем чаще случаются экстремальные движения цен, "
         f"которые не предсказываются стандартными моделями."
     )
+
+    return rolling_alpha  # Return to be used elsewhere
 
 
 def plot_qq_charts(log_returns, fit_params):
@@ -545,7 +636,7 @@ def plot_qq_charts(log_returns, fit_params):
 
     # Q-Q против Леви-стабильного
     stats.probplot(log_returns, dist=levy_stable, sparams=(ls_alpha, ls_beta, ls_loc, ls_scale), plot=axes[1])
-    axes[1].set_title(f'Q-Q: Леви-стабильное (α={ls_alpha:.2f})', fontsize=12, fontweight='bold')
+    axes[1].set_title(f'Q-Q: Леви-стабильное (Stress α={ls_alpha:.2f})', fontsize=12, fontweight='bold')
     axes[1].set_xlabel('Теоретические квантили', fontsize=10)
     axes[1].set_ylabel('Эмпирические квантили', fontsize=10)
     axes[1].grid(True, alpha=0.3)
@@ -600,7 +691,7 @@ def plot_qq_charts(log_returns, fit_params):
 st.sidebar.header("⚙️ Параметры анализа")
 ticker = st.sidebar.text_input("Тикер актива", value="^GSPC",
                                help="Например: ^GSPC (S&P500), AAPL (Apple), BTC-USD (Bitcoin)")
-start_date = st.sidebar.date_input("Дата начала", pd.to_datetime("2010-01-01"))
+start_date = st.sidebar.date_input("Дата начала", pd.to_datetime("2019-01-01"))
 end_date = st.sidebar.date_input("Дата окончания", pd.to_datetime("today"))
 
 # Проверка корректности дат
@@ -648,6 +739,17 @@ rolling_window = st.sidebar.slider(
     help="Размер скользящего окна. Рекомендуется 252 дня (1 торговый год)"
 )
 
+# НОВАЯ НАСТРОЙКА: Чувствительность хвостов для Rolling Alpha
+tail_cutoff_percent = st.sidebar.slider(
+    "Чувствительность к хвостам (%)",
+    min_value=50,
+    max_value=99,
+    value=90,
+    step=1,
+    help="Какой % самых сильных движений считать 'хвостом'. 90% = берем только топ-10% кризисов. Чем выше %, тем чувствительнее Alpha."
+)
+tail_cutoff = tail_cutoff_percent / 100.0
+
 if rolling_window > days_diff - 100:
     st.sidebar.warning(f"⚠️ Окно ({rolling_window} дней) слишком велико для выбранного периода ({days_diff} дней).")
 
@@ -673,6 +775,9 @@ with col_info2:
         "• Для горизонта **252 дня** расчет займет **1-2 минуты**\n"
         "• Большие окна (>500 дней) значительно замедляют расчет"
     )
+# Инициализация session_state для хранения результатов
+if 'analysis_complete' not in st.session_state:
+    st.session_state.analysis_complete = False
 
 if st.button("🚀 Запустить анализ", type="primary", use_container_width=True, help="Начать полный анализ рисков"):
 
@@ -689,9 +794,21 @@ if st.button("🚀 Запустить анализ", type="primary", use_contain
         g_mu, g_std = norm.fit(log_returns)
         progress_bar.progress(30)
 
-        status_text.text("Шаг 2/3: Подгонка Леви-стабильной модели (может занять время)...")
+        status_text.text("Шаг 2/3: Расчет скользящей Alpha и поиск худшего сценария...")
 
-        ls_alpha, ls_beta, ls_loc, ls_scale = fit_levy_stable_fast(log_returns, max_samples=2000)
+        # 1. Сначала считаем Rolling Alpha, чтобы найти худший сценарий
+        rolling_alpha = calculate_rolling_alpha(log_returns, rolling_window, tail_cutoff)
+
+        # Определяем "Stress" Alpha (худшее значение)
+        if rolling_alpha is not None and not rolling_alpha.empty:
+            worst_case_alpha = rolling_alpha.min()
+        else:
+            # Fallback
+            worst_case_alpha, _, _, _ = fit_levy_stable_fast(log_returns, tail_cutoff)
+
+        # Получаем остальные параметры Леви (можно использовать глобальные или пересчитать)
+        # Для простоты используем глобальную подгонку для beta, loc, scale
+        _, ls_beta, ls_loc, ls_scale = fit_levy_stable_fast(log_returns, tail_cutoff)
 
         progress_bar.progress(60)
 
@@ -703,92 +820,123 @@ if st.button("🚀 Запустить анализ", type="primary", use_contain
         progress_bar.progress(100)
         status_text.text("✅ Подгонка моделей завершена!")
 
+        # ВАЖНО: Используем worst_case_alpha для модели Леви
         fit_params = {
             "gaussian": (g_mu, g_std),
-            "levy": (ls_alpha, ls_beta, ls_loc, ls_scale),
+            "levy": (worst_case_alpha, ls_beta, ls_loc, ls_scale),  # ПОДМЕНА НА ХУДШИЙ СЛУЧАЙ
             "garch": garch_fit
         }
+
+        # Сохраняем результаты в session_state
+        st.session_state.data = data
+        st.session_state.log_returns = log_returns
+        st.session_state.price_col = price_col
+        st.session_state.fit_params = fit_params
+        st.session_state.analysis_complete = True
+        st.session_state.ticker = ticker
+        st.session_state.initial_capital = initial_capital
+        st.session_state.horizon_days = horizon_days
+        st.session_state.confidence_level = confidence_level
+        st.session_state.rolling_window = rolling_window
+        st.session_state.tail_cutoff = tail_cutoff
+        st.session_state.rolling_alpha_series = rolling_alpha  # Сохраняем серию для графика
 
         # Очищаем индикаторы прогресса
         progress_bar.empty()
         status_text.empty()
 
-        st.success("Анализ завершен! Результаты на вкладках ниже.")
+        st.success(f"Анализ завершен! Для модели Леви используется стресс-сценарий: Alpha = {worst_case_alpha:.3f}")
 
-        tab1, tab2, tab3, tab4 = st.tabs([
-            "Обзор и подгонка распределений",
-            "Анализ Value-at-Risk (VaR)",
-            "Динамический анализ риска (Rolling Alpha)",
-            "Сравнение Q-Q"
-        ])
+# Отображаем результаты только если анализ был выполнен
+if st.session_state.analysis_complete:
 
-        with tab1:
-            st.header("📊 Динамика цены и логарифмической доходности")
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "Обзор и подгонка распределений",
+        "Анализ Value-at-Risk (VaR)",
+        "Динамический анализ риска (Rolling Alpha)",
+        "Сравнение Q-Q"
+    ])
 
-            # Статистика данных
-            st.subheader("1. Основные статистики")
-            stat_col1, stat_col2, stat_col3, stat_col4 = st.columns(4)
-            stat_col1.metric("Торговых дней", len(log_returns))
-            stat_col2.metric("Средняя доходность", f"{log_returns.mean() * 100:.4f}%")
-            stat_col3.metric("Волатильность (дневная)", f"{log_returns.std() * 100:.2f}%")
-            stat_col4.metric("Волатильность (годовая)", f"{log_returns.std() * np.sqrt(252) * 100:.2f}%")
+    with tab1:
+        st.header("📊 Динамика цены и логарифмической доходности")
 
-            col1, col2 = st.columns(2)
-            with col1:
-                st.subheader(f"Цена закрытия ({price_col})")
-                st.line_chart(data[price_col])
-            with col2:
-                st.subheader("Дневная лог-доходность")
-                st.line_chart(log_returns)
+        # Статистика данных
+        st.subheader("1. Основные статистики")
+        stat_col1, stat_col2, stat_col3, stat_col4 = st.columns(4)
+        stat_col1.metric("Торговых дней", len(st.session_state.log_returns))
+        stat_col2.metric("Средняя доходность", f"{st.session_state.log_returns.mean() * 100:.4f}%")
+        stat_col3.metric("Волатильность (дневная)", f"{st.session_state.log_returns.std() * 100:.2f}%")
+        stat_col4.metric("Волатильность (годовая)", f"{st.session_state.log_returns.std() * np.sqrt(252) * 100:.2f}%")
 
-            st.header("🔬 Сравнение моделей распределений")
-            plot_distributions_pdf(log_returns, fit_params, ticker)
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader(f"Цена закрытия ({st.session_state.price_col})")
+            st.line_chart(st.session_state.data[st.session_state.price_col])
+        with col2:
+            st.subheader("Дневная лог-доходность")
+            st.line_chart(st.session_state.log_returns)
 
-        with tab2:
-            st.header("💰 Оценка риска с помощью симуляции Монте-Карло")
-            var_g, var_ls, var_garch = run_and_plot_var_simulation(fit_params, initial_capital, horizon_days,
-                                                                   confidence_level)
+        st.header("🔬 Сравнение моделей распределений")
+        plot_distributions_pdf(st.session_state.log_returns, st.session_state.fit_params, st.session_state.ticker)
 
-        with tab3:
-            st.header("⏰ Анализ стабильности риска во времени")
-            plot_rolling_alpha(log_returns, rolling_window, ticker)
+    with tab2:
+        st.header("💰 Оценка риска с помощью симуляции Монте-Карло")
+        var_g, var_ls, var_garch = run_and_plot_var_simulation(
+            st.session_state.fit_params,
+            st.session_state.initial_capital,
+            st.session_state.horizon_days,
+            st.session_state.confidence_level
+        )
 
-        with tab4:
-            st.header("📐 Анализ квантиль-квантиль (Q-Q)")
-            plot_qq_charts(log_returns, fit_params)
+    with tab3:
+        st.header("⏰ Анализ стабильности риска во времени")
+        # Используем сохраненные значения
+        cutoff_val = st.session_state.get('tail_cutoff', 0.70)
+        # Используем уже посчитанную серию
+        if 'rolling_alpha_series' in st.session_state:
+            plot_rolling_alpha(st.session_state.rolling_alpha_series, st.session_state.rolling_window,
+                               st.session_state.ticker, cutoff_val)
+        else:
+            plot_rolling_alpha(
+                calculate_rolling_alpha(st.session_state.log_returns, st.session_state.rolling_window, cutoff_val),
+                st.session_state.rolling_window, st.session_state.ticker, cutoff_val)
 
-        # Финальные рекомендации
-        st.markdown("---")
-        st.header("🎯 Общие выводы и рекомендации")
+    with tab4:
+        st.header("📐 Анализ квантиль-квантиль (Q-Q)")
+        plot_qq_charts(st.session_state.log_returns, st.session_state.fit_params)
 
-        conclusion_col1, conclusion_col2 = st.columns(2)
+    # Финальные рекомендации
+    st.markdown("---")
+    st.header("🎯 Общие выводы и рекомендации")
 
-        with conclusion_col1:
-            var_values = [var_g, var_ls, var_garch]
-            min_var = min(var_values)
-            max_var = max(var_values)
-            st.success(
-                "**✅ Что мы узнали:**\n\n"
-                f"• Индекс стабильности α = **{ls_alpha:.2f}** "
-                f"{'(высокий риск черных лебедей)' if ls_alpha < 1.8 else '(умеренный риск)'}\n\n"
-                f"• VaR (99% за {horizon_days} дней): от **{format_currency(min_var)}** до **{format_currency(max_var)}**\n\n"
-                "• Гауссова модель может **существенно недооценивать** реальные риски\n\n"
-                "• GARCH и Леви-модели дают более реалистичную картину"
-            )
+    conclusion_col1, conclusion_col2 = st.columns(2)
 
-        with conclusion_col2:
-            st.warning(
-                "**⚠️ Рекомендации:**\n\n"
-                "1. **Не полагайтесь только на Гауссову модель** при оценке рисков\n\n"
-                "2. Учитывайте **'толстые хвосты'** — экстремальные события случаются чаще, чем предсказывает нормальное распределение\n\n"
-                "3. Используйте **консервативные оценки** VaR (Леви-модель)\n\n"
-                "4. Регулярно **пересматривайте** риск-модели на актуальных данных"
-            )
+    with conclusion_col1:
+        ls_alpha = st.session_state.fit_params['levy'][0]
+        st.success(
+            "**✅ Что мы узнали:**\n\n"
+            f"• Индекс стабильности α = **{ls_alpha:.2f}** "
+            f"{'(высокий риск черных лебедей)' if ls_alpha < 1.8 else '(умеренный риск)'}\n\n"
+            "• Гауссова модель может **существенно недооценивать** реальные риски\n\n"
+            "• GARCH и Леви-модели дают более реалистичную картину"
+        )
+
+    with conclusion_col2:
+        st.warning(
+            "**⚠️ Рекомендации:**\n\n"
+            "1. **Не полагайтесь только на Гауссову модель** при оценке рисков\n\n"
+            "2. Учитывайте **'толстые хвосты'** — экстремальные события случаются чаще, чем предсказывает нормальное распределение\n\n"
+            "3. Используйте **консервативные оценки** VaR (Леви-модель)\n\n"
+            "4. Регулярно **пересматривайте** риск-модели на актуальных данных"
+        )
 
 else:
     st.info("👆 Настройте параметры на боковой панели и нажмите кнопку **'Запустить анализ'** для начала работы.")
-
 st.sidebar.markdown("---")
+if st.session_state.get('analysis_complete', False):
+    if st.sidebar.button("🔄 Сбросить анализ", type="secondary", use_container_width=True):
+        st.session_state.analysis_complete = False
+        st.rerun()
 st.sidebar.info(
     "**📚 Инструкция:**\n\n"
     "1️⃣ Введите **тикер** актива ([Yahoo Finance](https://finance.yahoo.com/lookup/))\n\n"
