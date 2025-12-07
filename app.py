@@ -119,73 +119,35 @@ def load_data(ticker, start_date, end_date):
         return None, None, None
 
 
-def fit_levy_stable_fast(returns_data, tail_percentile=0.70):
+def fit_levy_stable_fast(returns_data):
     """
-    Быстрая эмпирическая оценка параметров стабильного распределения.
-    Использует метод регрессии хвостов (Tail Index) для оценки Alpha.
-
-    Args:
-        returns_data: Данные доходности
-        tail_percentile: Порог для определения хвоста (0.70 = топ 30%, 0.90 = топ 10%)
+    Оценка параметров через Maximum Likelihood Estimation (MLE).
+    Использует scipy.stats.levy_stable.fit.
     """
-    # Преобразуем в массив numpy и убираем NaN
+    # Преобразуем в массив и чистим от NaN
     x = returns_data.values if isinstance(returns_data, pd.Series) else returns_data
     x = x[~np.isnan(x)]
 
+    # Если данных слишком мало, возвращаем Нормальное (Alpha=2)
     if len(x) < 10:
-        return 1.8, 0.0, np.median(x), np.std(x)
+        return 2.0, 0.0, np.mean(x), np.std(x)
 
-    # 1. Оценка Loc (Медиана) и Scale (через IQR)
-    # Для нормального распр. IQR = 1.349 * sigma.
-    q25, q50, q75 = np.percentile(x, [25, 50, 75])
-    loc = q50
-    scale = (q75 - q25) / 1.349
-
-    # 2. Оценка Alpha (Эмпирический метод: регрессия хвостов Log-Log)
-    # Alpha определяет наклон хвоста распределения в логарифмическом масштабе.
     try:
-        abs_dev = np.abs(x - loc)
-        sorted_dev = np.sort(abs_dev)
-        n = len(sorted_dev)
+        # --- ГЛАВНОЕ ИЗМЕНЕНИЕ ---
+        # levy_stable.fit считает MLE численно (медленно, но точно)
+        params = levy_stable.fit(x)
+        # params возвращает кортеж (alpha, beta, loc, scale)
 
-        # Используем порог из аргументов
-        cutoff_idx = int(n * tail_percentile)
+        # Ограничиваем Alpha, так как MLE иногда выдает > 2 на финансовых данных
+        alpha = max(1.0, min(2.0, params[0]))
+        beta = max(-1.0, min(1.0, params[1]))
+        loc = params[2]
+        scale = params[3]
 
-        if cutoff_idx < n - 5:
-            tail_data = sorted_dev[cutoff_idx:]
-
-            # Эмпирическая функция выживания: P(X > x)
-            # ln(rank) ~ C - alpha * ln(x)
-            log_x = np.log(tail_data)
-            ranks = np.arange(len(tail_data), 0, -1)
-            log_y = np.log(ranks)
-
-            # Линейная регрессия
-            slope, _ = np.polyfit(log_x, log_y, 1)
-            alpha = -slope
-        else:
-            alpha = 1.8
+        return alpha, beta, loc, scale
     except:
-        alpha = 1.8
-
-    # Ограничиваем alpha разумными для финансов пределами [1.0, 2.0]
-    # Рынки редко имеют alpha < 1.0 (бесконечное мат. ожидание) или > 2.0
-    alpha = max(1.0, min(2.0, alpha))
-
-    # 3. Оценка Beta (Асимметрия)
-    # Используем простую квантильную оценку асимметрии
-    try:
-        q05, q95 = np.percentile(x, [5, 95])
-        numer = (q95 - loc) - (loc - q05)
-        denom = (q95 - q05)
-        beta = numer / denom if denom > 0 else 0.0
-    except:
-        beta = 0.0
-
-    # Ограничиваем Beta
-    beta = max(-1.0, min(1.0, beta))
-
-    return alpha, beta, loc, scale
+        # Если оптимизатор упал, возвращаем параметры Гаусса
+        return 2.0, 0.0, np.mean(x), np.std(x)
 
 
 def plot_distributions_pdf(log_returns, fit_params, ticker):
@@ -493,23 +455,58 @@ def run_and_plot_var_simulation(fit_params, capital, horizon, confidence, sims=1
     return var_g, var_ls, var_garch
 
 
-@st.cache_data
-def calculate_rolling_alpha(log_returns, window_size, tail_cutoff=0.70):
-    """Рассчитывает параметр alpha в скользящем окне."""
-    if len(log_returns) < window_size:
+@st.cache_data(show_spinner=False)
+def calculate_rolling_alpha(log_returns, window_size, step=10):
+    """
+    Считает скользящую Alpha методом MLE.
+    ВАЖНО: Использует step (шаг) и интерполяцию для ускорения.
+    """
+    data_values = log_returns.values
+    n = len(data_values)
+
+    if n < window_size:
         return None
 
-    def safe_levy_fit(x):
-        if len(x) >= 100:
-            try:
-                # Быстрая подгонка с ограничением выборки
-                alpha, _, _, _ = fit_levy_stable_fast(x, tail_percentile=tail_cutoff)
-                return alpha
-            except:
-                return np.nan
-        return np.nan
+    # Генерируем индексы начал окон с шагом (например, раз в 10 дней)
+    indices = list(range(0, n - window_size + 1, step))
+    alphas = []
+    dates = []
 
-    rolling_alpha = log_returns.rolling(window=window_size).apply(safe_levy_fit, raw=False)
+    # Чтобы интерфейс не завис намертво, добавим прогресс
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    total = len(indices)
+
+    for i, start_idx in enumerate(indices):
+        # Обновляем прогресс раз в 5 шагов
+        if i % 5 == 0:
+            progress_bar.progress(int((i / total) * 100))
+            status_text.text(f"MLE расчет: {i}/{total} окон...")
+
+        # Берем окно
+        window = data_values[start_idx: start_idx + window_size]
+
+        try:
+            # Вызываем нашу новую функцию фиттинга
+            params = levy_stable.fit(window)
+            alpha = max(1.0, min(2.0, params[0]))
+            alphas.append(alpha)
+        except:
+            alphas.append(np.nan)
+
+        # Записываем дату конца окна
+        dates.append(log_returns.index[start_idx + window_size - 1])
+
+    progress_bar.empty()
+    status_text.empty()
+
+    # Собираем разреженную серию
+    sparse_series = pd.Series(alphas, index=dates)
+
+    # Растягиваем на весь диапазон дат (интерполяция)
+    full_range = log_returns.index[window_size - 1:]
+    rolling_alpha = sparse_series.reindex(full_range).interpolate(method='linear')
+
     return rolling_alpha.dropna()
 
 
@@ -740,15 +737,14 @@ rolling_window = st.sidebar.slider(
 )
 
 # НОВАЯ НАСТРОЙКА: Чувствительность хвостов для Rolling Alpha
-tail_cutoff_percent = st.sidebar.slider(
-    "Чувствительность к хвостам (%)",
-    min_value=50,
-    max_value=99,
-    value=90,
-    step=1,
-    help="Какой % самых сильных движений считать 'хвостом'. 90% = берем только топ-10% кризисов. Чем выше %, тем чувствительнее Alpha."
+# --- ВМЕСТО tail_cutoff_percent ---
+calc_step = st.sidebar.slider(
+    "Шаг пересчета MLE (дней)",
+    min_value=5,
+    max_value=30,
+    value=10,
+    help="MLE считается медленно. Шаг 10 означает пересчет раз в 10 дней. Меньше = точнее, но дольше."
 )
-tail_cutoff = tail_cutoff_percent / 100.0
 
 if rolling_window > days_diff - 100:
     st.sidebar.warning(f"⚠️ Окно ({rolling_window} дней) слишком велико для выбранного периода ({days_diff} дней).")
@@ -797,18 +793,17 @@ if st.button("🚀 Запустить анализ", type="primary", use_contain
         status_text.text("Шаг 2/3: Расчет скользящей Alpha и поиск худшего сценария...")
 
         # 1. Сначала считаем Rolling Alpha, чтобы найти худший сценарий
-        rolling_alpha = calculate_rolling_alpha(log_returns, rolling_window, tail_cutoff)
-
+        rolling_alpha = calculate_rolling_alpha(log_returns, rolling_window, step=calc_step)
         # Определяем "Stress" Alpha (худшее значение)
         if rolling_alpha is not None and not rolling_alpha.empty:
             worst_case_alpha = rolling_alpha.min()
         else:
             # Fallback
-            worst_case_alpha, _, _, _ = fit_levy_stable_fast(log_returns, tail_cutoff)
+            worst_case_alpha, _, _, _ = fit_levy_stable_fast(log_returns)
 
         # Получаем остальные параметры Леви (можно использовать глобальные или пересчитать)
         # Для простоты используем глобальную подгонку для beta, loc, scale
-        _, ls_beta, ls_loc, ls_scale = fit_levy_stable_fast(log_returns, tail_cutoff)
+        _, ls_beta, ls_loc, ls_scale = fit_levy_stable_fast(log_returns)
 
         progress_bar.progress(60)
 
@@ -838,7 +833,6 @@ if st.button("🚀 Запустить анализ", type="primary", use_contain
         st.session_state.horizon_days = horizon_days
         st.session_state.confidence_level = confidence_level
         st.session_state.rolling_window = rolling_window
-        st.session_state.tail_cutoff = tail_cutoff
         st.session_state.rolling_alpha_series = rolling_alpha  # Сохраняем серию для графика
 
         # Очищаем индикаторы прогресса
