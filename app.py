@@ -510,40 +510,23 @@ def calculate_rolling_alpha(log_returns, window_size, step=10):
     return rolling_alpha.dropna()
 
 
-def plot_rolling_alpha(log_returns, window_size, ticker, tail_cutoff):
+def plot_rolling_alpha(rolling_alpha, window_size, ticker):
     """Отображает график rolling alpha."""
     st.subheader("Динамика параметра стабильности α (Alpha)")
     st.write("""
         Параметр **α (alpha)** Леви-стабильного распределения определяет "тяжесть хвостов" — то есть, вероятность экстремальных событий.
         - **α = 2:** Нормальное распределение (нет "толстых хвостов").
         - **α < 2:** Распределение с "толстыми хвостами".
-        **Чем ниже α, тем выше вероятность "черных лебедей" (катастрофических событий).** Этот график показывает, как менялась оценка этого параметра во времени в скользящем окне.
+        **Чем ниже α, тем выше вероятность "черных лебедей" (катастрофических событий).** 
+        Этот график показывает, как менялась оценка этого параметра во времени в скользящем окне.
     """, unsafe_allow_html=True)
 
-    # Проверка достаточности данных
-    min_required = window_size + 100  # Нужен запас для расчета
-    if len(log_returns) < min_required:
-        st.warning(
-            f"⚠️ **Недостаточно данных для Rolling Alpha анализа!**\n\n"
-            f"• Имеется данных: **{len(log_returns)}** дней\n"
-            f"• Требуется минимум: **{min_required}** дней (окно {window_size} + 100 для расчета)\n\n"
-            f"**Рекомендации:**\n"
-            f"1. Увеличьте период анализа (например, с 2010 года)\n"
-            f"2. Уменьшите размер окна (попробуйте 100-150 дней)\n"
-            f"3. Для качественного анализа нужно минимум 2-3 года данных"
-        )
-        return
-
-    with st.spinner(f"Расчет rolling alpha с окном {window_size} дней (чувствительность {tail_cutoff * 100:.0f}%)..."):
-        rolling_alpha = calculate_rolling_alpha(log_returns, window_size, tail_cutoff)
-
-    if rolling_alpha is None or rolling_alpha.empty or len(rolling_alpha) < 10:
+    if rolling_alpha is None or rolling_alpha.empty or len(rolling_alpha) < 5:
         st.error(
-            "❌ **Не удалось рассчитать rolling alpha.**\n\n"
+            "❌ **Не удалось построить график rolling alpha.**\n\n"
             "Возможные причины:\n"
-            "• Слишком короткий период данных\n"
-            "• Размер окна слишком большой относительно периода\n"
-            "• Недостаточно вариации в данных для оценки параметра α"
+            "• Недостаточно данных для анализа\n"
+            "• Ошибка при расчете параметров"
         )
         return
 
@@ -885,15 +868,21 @@ if st.session_state.analysis_complete:
     with tab3:
         st.header("⏰ Анализ стабильности риска во времени")
         # Используем сохраненные значения
-        cutoff_val = st.session_state.get('tail_cutoff', 0.70)
-        # Используем уже посчитанную серию
-        if 'rolling_alpha_series' in st.session_state:
-            plot_rolling_alpha(st.session_state.rolling_alpha_series, st.session_state.rolling_window,
-                               st.session_state.ticker, cutoff_val)
-        else:
-            plot_rolling_alpha(
-                calculate_rolling_alpha(st.session_state.log_returns, st.session_state.rolling_window, cutoff_val),
-                st.session_state.rolling_window, st.session_state.ticker, cutoff_val)
+        
+        # Получаем серию (из кэша или считаем)
+        if 'rolling_alpha_series' not in st.session_state:
+             with st.spinner(f"Расчет rolling alpha с окном {st.session_state.rolling_window} дней..."):
+                 st.session_state.rolling_alpha_series = calculate_rolling_alpha(
+                     st.session_state.log_returns, 
+                     st.session_state.rolling_window, 
+                     step=10
+                 )
+
+        plot_rolling_alpha(
+            st.session_state.rolling_alpha_series, 
+            st.session_state.rolling_window, 
+            st.session_state.ticker
+        )
 
     with tab4:
         st.header("📐 Анализ квантиль-квантиль (Q-Q)")
