@@ -387,63 +387,6 @@ def run_and_plot_var_simulation(fit_params, capital, horizon, confidence, sims=1
     col3.metric(label="VaR (GARCH-t)", value=f"${var_garch:,.0f}", delta=f"{((var_garch - var_g) / var_g):.1%}",
                 delta_color="inverse", help="Дельта показывает разницу с Гауссовой моделью.")
 
-    st.subheader("2. Визуализация распределения смоделированных убытков")
-
-    # Диагностическая информация
-    with st.expander("📊 Статистика симуляций (для отладки)"):
-        col_a, col_b, col_c = st.columns(3)
-        with col_a:
-            st.write("**Гауссова модель:**")
-            st.write(f"Min убыток: ${losses_g.min():,.0f}")
-            st.write(f"Max убыток: ${losses_g.max():,.0f}")
-            st.write(f"Median: ${np.median(losses_g):,.0f}")
-        with col_b:
-            st.write("**Леви-стабильная:**")
-            st.write(f"Min убыток: ${losses_ls.min():,.0f}")
-            st.write(f"Max убыток: ${losses_ls.max():,.0f}")
-            st.write(f"Median: ${np.median(losses_ls):,.0f}")
-        with col_c:
-            st.write("**GARCH-t:**")
-            st.write(f"Min убыток: ${losses_garch.min():,.0f}")
-            st.write(f"Max убыток: ${losses_garch.max():,.0f}")
-            st.write(f"Median: ${np.median(losses_garch):,.0f}")
-
-    fig, ax = plt.subplots(figsize=(12, 7))
-
-    # Улучшенный расчет диапазона для графика
-    all_losses = np.concatenate([losses_g, losses_ls, losses_garch])
-    # Используем перцентили для определения разумного диапазона (отсекаем экстремальные выбросы)
-    lower_bound = np.percentile(all_losses, 0.1)
-    upper_bound = np.percentile(all_losses, 99.9)
-
-    # Создаем бины для гистограммы
-    bins = np.linspace(lower_bound, upper_bound, 100)
-
-    ax.hist(losses_g, bins=bins, density=True, alpha=0.6, label='Гауссова модель', color='red', edgecolor='darkred')
-    ax.hist(losses_ls, bins=bins, density=True, alpha=0.6, label='Леви-стабильная (Stress)', color='green',
-            edgecolor='darkgreen')
-    ax.hist(losses_garch, bins=bins, density=True, alpha=0.6, label='GARCH-t модель', color='purple',
-            edgecolor='indigo')
-
-    # Добавляем линии VaR
-    ax.axvline(var_g, color='darkred', linestyle='--', lw=2.5,
-               label=f'{confidence}% VaR (Гаусс): {format_currency(var_g)}')
-    ax.axvline(var_ls, color='darkgreen', linestyle='--', lw=2.5,
-               label=f'{confidence}% VaR (Леви): {format_currency(var_ls)}')
-    ax.axvline(var_garch, color='indigo', linestyle='--', lw=2.5,
-               label=f'{confidence}% VaR (GARCH-t): {format_currency(var_garch)}')
-
-    ax.set_title(f'Распределение убытков портфеля за {horizon} дней ({sims} симуляций)', fontsize=14, fontweight='bold')
-    ax.set_xlabel('Убыток ($)', fontsize=12)
-    ax.set_ylabel('Плотность вероятности', fontsize=12)
-    ax.legend(loc='best', fontsize=10)
-    ax.grid(True, linestyle='--', alpha=0.4)
-
-    # Форматирование оси X
-    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: format_currency(x)))
-
-    st.pyplot(fig)
-
     # Добавляем интерпретацию результатов
     st.info(
         f"**💡 Интерпретация результатов:**\n\n"
