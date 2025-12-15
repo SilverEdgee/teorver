@@ -14,6 +14,15 @@ st.set_page_config(
     page_icon="📈",
     layout="wide"
 )
+
+# Инициализация session_state
+if 'analysis_complete' not in st.session_state:
+    st.session_state.analysis_complete = False
+
+def reset_analysis():
+    """Сбрасывает результаты анализа при изменении параметров."""
+    st.session_state.analysis_complete = False
+
 warnings.filterwarnings("ignore")
 st.markdown("""
 <style>
@@ -351,9 +360,20 @@ def plot_distributions_pdf(log_returns, fit_params, ticker):
     )
 
 
-def run_and_plot_var_simulation(fit_params, capital, horizon, confidence, sims=10000):
+def run_and_plot_var_simulation(log_returns, fit_params, capital, horizon, confidence, sims=10000):
     """Проводит симуляцию Монте-Карло и оценивает VaR."""
     st.subheader("1. Результаты симуляции Value-at-Risk (VaR)")
+
+    # --- Расчет исторического максимума убытков (Realized Loss) ---
+    # Считаем скользящую сумму лог-доходностей за горизонт
+    rolling_log_returns = log_returns.rolling(window=horizon).sum().dropna()
+    # Находим минимальную доходность (худший период)
+    worst_period_log_return = rolling_log_returns.min()
+    # Переводим в деньги
+    # Формула: Capital - (Capital * exp(worst_return))
+    # Если worst_return отрицательный, exp < 1, мы получаем положительный убыток
+    max_historical_loss = capital - (capital * np.exp(worst_period_log_return))
+
     with st.spinner(f"Запуск симуляции Монте-Карло ({sims} сценариев)..."):
         g_mu, g_std = fit_params['gaussian']
         g_returns_sim = norm.rvs(loc=g_mu, scale=g_std, size=(horizon, sims))
@@ -378,7 +398,7 @@ def run_and_plot_var_simulation(fit_params, capital, horizon, confidence, sims=1
         var_garch = np.percentile(losses_garch, confidence)
 
     st.write(f"**{confidence}% VaR на горизонте {horizon} дней для портфеля в ${capital:,.0f}**")
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric(label="VaR (Гаусс)", value=f"${var_g:,.0f}",
                 help=f"С вероятностью {100 - confidence:.1f}% убыток НЕ превысит эту сумму.")
     col2.metric(label="VaR (Леви-стабильная)", value=f"${var_ls:,.0f}", delta=f"{((var_ls - var_g) / var_g):.1%}",
@@ -386,6 +406,10 @@ def run_and_plot_var_simulation(fit_params, capital, horizon, confidence, sims=1
                 help="Дельта показывает разницу с Гауссовой моделью. Используется Worst Case Alpha.")
     col3.metric(label="VaR (GARCH-t)", value=f"${var_garch:,.0f}", delta=f"{((var_garch - var_g) / var_g):.1%}",
                 delta_color="inverse", help="Дельта показывает разницу с Гауссовой моделью.")
+    col4.metric(label="Макс. ист. убыток", value=f"${max_historical_loss:,.0f}",
+                delta=f"{((max_historical_loss - var_g) / var_g):.1%}",
+                delta_color="inverse",
+                help=f"Худший реальный убыток, который случился бы с этим портфелем за {horizon} дней на выбранном историческом отрезке.")
 
     # Добавляем интерпретацию результатов
     st.info(
@@ -615,9 +639,10 @@ def plot_qq_charts(log_returns, fit_params):
 # --- 3. Пользовательский интерфейс (Боковая панель) ---
 st.sidebar.header("⚙️ Параметры анализа")
 ticker = st.sidebar.text_input("Тикер актива", value="^GSPC",
-                               help="Например: ^GSPC (S&P500), AAPL (Apple), BTC-USD (Bitcoin)")
-start_date = st.sidebar.date_input("Дата начала", pd.to_datetime("2019-01-01"))
-end_date = st.sidebar.date_input("Дата окончания", pd.to_datetime("today"))
+                               help="Например: ^GSPC (S&P500), AAPL (Apple), BTC-USD (Bitcoin)",
+                               on_change=reset_analysis)
+start_date = st.sidebar.date_input("Дата начала", pd.to_datetime("2019-01-01"), on_change=reset_analysis)
+end_date = st.sidebar.date_input("Дата окончания", pd.to_datetime("today"), on_change=reset_analysis)
 
 # Проверка корректности дат
 if start_date >= end_date:
@@ -635,7 +660,8 @@ initial_capital = st.sidebar.number_input(
     min_value=1000,
     value=1_000_000,
     step=1000,
-    help="Размер портфеля для расчета Value-at-Risk"
+    help="Размер портфеля для расчета Value-at-Risk",
+    on_change=reset_analysis
 )
 confidence_level = st.sidebar.slider(
     "Уровень доверия (%)",
@@ -643,7 +669,8 @@ confidence_level = st.sidebar.slider(
     max_value=99.9,
     value=99.0,
     step=0.5,
-    help="Вероятность, что убыток не превысит VaR. Стандартные значения: 95%, 99%, 99.9%"
+    help="Вероятность, что убыток не превысит VaR. Стандартные значения: 95%, 99%, 99.9%",
+    on_change=reset_analysis
 )
 horizon_days = st.sidebar.slider(
     "Горизонт симуляции (дней)",
@@ -651,7 +678,8 @@ horizon_days = st.sidebar.slider(
     max_value=252,
     value=30,
     step=1,
-    help="Период прогноза. 21 день ≈ 1 месяц, 252 дня ≈ 1 год"
+    help="Период прогноза. 21 день ≈ 1 месяц, 252 дня ≈ 1 год",
+    on_change=reset_analysis
 )
 
 st.sidebar.header("📊 Динамический анализ")
@@ -661,7 +689,8 @@ rolling_window = st.sidebar.slider(
     max_value=1000,
     value=252,
     step=50,
-    help="Размер скользящего окна. Рекомендуется 252 дня (1 торговый год)"
+    help="Размер скользящего окна. Рекомендуется 252 дня (1 торговый год)",
+    on_change=reset_analysis
 )
 
 # НОВАЯ НАСТРОЙКА: Чувствительность хвостов для Rolling Alpha
@@ -671,7 +700,8 @@ calc_step = st.sidebar.slider(
     min_value=5,
     max_value=30,
     value=10,
-    help="MLE считается медленно. Шаг 10 означает пересчет раз в 10 дней. Меньше = точнее, но дольше."
+    help="MLE считается медленно. Шаг 10 означает пересчет раз в 10 дней. Меньше = точнее, но дольше.",
+    on_change=reset_analysis
 )
 
 if rolling_window > days_diff - 100:
@@ -699,9 +729,6 @@ with col_info2:
         "• Для горизонта **252 дня** расчет займет **1-2 минуты**\n"
         "• Большие окна (>500 дней) значительно замедляют расчет"
     )
-# Инициализация session_state для хранения результатов
-if 'analysis_complete' not in st.session_state:
-    st.session_state.analysis_complete = False
 
 if st.button("🚀 Запустить анализ", type="primary", use_container_width=True, help="Начать полный анализ рисков"):
 
@@ -804,6 +831,7 @@ if st.session_state.analysis_complete:
     with tab2:
         st.header("💰 Оценка риска с помощью симуляции Монте-Карло")
         var_g, var_ls, var_garch = run_and_plot_var_simulation(
+            st.session_state.log_returns,
             st.session_state.fit_params,
             st.session_state.initial_capital,
             st.session_state.horizon_days,
@@ -813,19 +841,19 @@ if st.session_state.analysis_complete:
     with tab3:
         st.header("⏰ Анализ стабильности риска во времени")
         # Используем сохраненные значения
-        
+
         # Получаем серию (из кэша или считаем)
         if 'rolling_alpha_series' not in st.session_state:
              with st.spinner(f"Расчет rolling alpha с окном {st.session_state.rolling_window} дней..."):
                  st.session_state.rolling_alpha_series = calculate_rolling_alpha(
-                     st.session_state.log_returns, 
-                     st.session_state.rolling_window, 
+                     st.session_state.log_returns,
+                     st.session_state.rolling_window,
                      step=10
                  )
 
         plot_rolling_alpha(
-            st.session_state.rolling_alpha_series, 
-            st.session_state.rolling_window, 
+            st.session_state.rolling_alpha_series,
+            st.session_state.rolling_window,
             st.session_state.ticker
         )
 
