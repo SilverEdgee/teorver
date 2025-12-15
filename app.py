@@ -370,7 +370,9 @@ def run_and_plot_var_simulation(fit_params, capital, horizon, confidence, sims=1
         garch_fit = fit_params['garch']
         forecasts = garch_fit.forecast(horizon=horizon, method='simulation', simulations=sims)
         sim_returns_garch_pct = forecasts.simulations.values[0].T
-        sim_returns_garch = np.log(sim_returns_garch_pct / 100 + 1)
+        # Fix: Input data was log-returns * 100, so simulation output is also log-returns * 100.
+        # No need to convert from simple returns using np.log(x + 1).
+        sim_returns_garch = sim_returns_garch_pct / 100
         final_capital_garch = capital * np.exp(sim_returns_garch.sum(axis=0))
         losses_garch = capital - final_capital_garch
         var_garch = np.percentile(losses_garch, confidence)
